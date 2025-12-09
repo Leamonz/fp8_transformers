@@ -1,0 +1,14 @@
+model_name: gpt2-s
+dataset_name: openwebtext
+learning_rate: 0.001
+per_device_batch_size: 8
+num_epochs: 3
+max_steps: -1
+warmup_steps: 2000
+weight_decay: 0.01
+gradient_accumulation_steps: 40
+max_seq_length: 1024
+seed: 42
+output_dir: ./fp8_gpt2_output
+use_fp8: true
+swanlab_log: true

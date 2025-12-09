@@ -1,0 +1,22 @@
+# Default configuration for GPT2 FP8 pretraining with Transformer Engine
+# Can be overridden via Hydra command-line, e.g.:
+# python -m fp8_training.pretrain_gpt2_fp8 model_name=gpt2-m num_epochs=1
+
+model_name: gpt2-s
+dataset_name: openwebtext
+
+learning_rate: 1e-3
+per_device_batch_size: 8
+num_epochs: 3
+max_steps: -1
+warmup_steps: 2000
+weight_decay: 0.01
+gradient_accumulation_steps: 40
+max_seq_length: 1024
+seed: 42
+val_split: 0.2
+
+# Output and instrumentation
+output_dir: ./fp8_gpt2_output
+use_fp8: true
+swanlab_log: true
