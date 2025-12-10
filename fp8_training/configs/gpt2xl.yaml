@@ -1,0 +1,18 @@
+# GPT2 XL preset (gpt2-xl)
+model:
+  name: gpt2-xl
+  model_name_or_path: gpt2-xl
+  tokenizer_name_or_path: gpt2-xl
+  revision: ""
+
+  # architecture / config hints
+  max_position_embeddings: 1024
+  vocab_size: 50257
+  hidden_size: 1600
+  num_hidden_layers: 48
+  num_attention_heads: 25
+  intermediate_size: 6400
+  layer_norm_epsilon: 1e-5
+  resid_pdrop: 0.1
+  embd_pdrop: 0.1
+  attn_pdrop: 0.1

@@ -1,0 +1,18 @@
+# GPT2 large preset (gpt2-l)
+model:
+  name: gpt2-l
+  model_name_or_path: gpt2-large
+  tokenizer_name_or_path: gpt2-large
+  revision: ""
+
+  # architecture / config hints
+  max_position_embeddings: 1024
+  vocab_size: 50257
+  hidden_size: 1280
+  num_hidden_layers: 36
+  num_attention_heads: 20
+  intermediate_size: 5120
+  layer_norm_epsilon: 1e-5
+  resid_pdrop: 0.1
+  embd_pdrop: 0.1
+  attn_pdrop: 0.1
