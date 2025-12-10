@@ -13,12 +13,11 @@ import hydra.utils as hy_utils
 import transformers
 from transformers import (
     AutoTokenizer,
-    AutoConfig,
-    GPT2LMHeadModel,
+    GPT2Config,
     get_linear_schedule_with_warmup,
     set_seed,
 )
-from fp8_models.te_gpt2 import TEGPT2LMHeadModel
+from fp8_training.fp8_models.te_gpt2 import TEGPT2LMHeadModel
 from datasets import load_dataset
 from torch.utils.data import DataLoader, DistributedSampler
 from torch.optim import AdamW
@@ -34,6 +33,7 @@ logger = logging.getLogger("fp8_trainer")
 
 try:
     import transformer_engine.pytorch as te
+    from transformer.engine.common.recipe import Format, DelayedScaling
     from transformer_engine.common import recipe_handler, RecipeHandler
 
     TRANSFORMER_ENGINE_AVAILABLE = True
@@ -47,7 +47,7 @@ from accelerate.utils import InitProcessGroupKwargs, TERecipeKwargs
 
 
 class DataProcessor:
-    """处理和预处理数据集"""
+    """dataset preprocessing"""
 
     def __init__(self, tokenizer, max_seq_length=1024, streaming=False):
         self.tokenizer = tokenizer
@@ -129,8 +129,14 @@ class GPT2FP8Trainer:
     def __init__(
         self,
         model_name: str,
+        model_name_or_path: Optional[str] = None,
+        tokenizer_name_or_path: Optional[str] = None,
+        revision: str = "",
+        load_pretrained_weights: bool = False,
+        # dataset / training
         dataset_name: str = "openwebtext",
         learning_rate: float = 5e-5,
+        betas: tuple[int] = (0.9, 0.999),
         per_device_batch_size: int = 8,
         num_epochs: int = 3,
         max_steps: int = -1,
@@ -140,14 +146,32 @@ class GPT2FP8Trainer:
         max_seq_length: int = 1024,
         seed: int = 42,
         output_dir: str = "./fp8_gpt2_output",
-        use_fp8: bool = True,
+        use_fp8: bool = True,  # use TransformerEngine fp8 training or not
         mixed_precision: str = "fp8",
         swanlab_log: bool = False,
         val_split: float = 0.2,
+        # model architecture hints
+        max_position_embeddings: int = 1024,
+        vocab_size: int = 50257,
+        hidden_size: int = 768,
+        num_hidden_layers: int = 12,
+        num_attention_heads: int = 12,
+        n_inner: Optional[int] = None,
+        activation_function: str = "gelu_new",
+        layer_norm_epsilon: float = 1e-5,
+        resid_pdrop: float = 0.1,
+        embd_pdrop: float = 0.1,
+        attn_pdrop: float = 0.1,
+        last_linear_fp8: bool = True,
     ):
         self.model_name = model_name
+        self.model_name_or_path = model_name_or_path
+        self.tokenizer_name_or_path = tokenizer_name_or_path
+        self.revision = revision
+        self.load_pretrained_weights = load_pretrained_weights
         self.dataset_name = dataset_name
         self.learning_rate = learning_rate
+        self.betas = betas
         self.per_device_batch_size = per_device_batch_size
         self.num_epochs = num_epochs
         self.max_steps = max_steps
@@ -161,6 +185,19 @@ class GPT2FP8Trainer:
         self.mixed_precision = mixed_precision if self.use_fp8 else "fp16"
         self.swanlab_log = swanlab_log
         self.val_split = val_split
+        # model architecture attributes
+        self.max_position_embeddings = max_position_embeddings
+        self.vocab_size = vocab_size
+        self.hidden_size = hidden_size
+        self.num_hidden_layers = num_hidden_layers
+        self.num_attention_heads = num_attention_heads
+        self.n_inner = n_inner
+        self.activation_function = activation_function
+        self.layer_norm_epsilon = layer_norm_epsilon
+        self.resid_pdrop = resid_pdrop
+        self.embd_pdrop = embd_pdrop
+        self.attn_pdrop = attn_pdrop
+        self.last_linear_fp8 = last_linear_fp8
 
         set_seed(seed)
 
@@ -177,17 +214,37 @@ class GPT2FP8Trainer:
 
     def _config(self):
         return {
-            "learning_rate": self.learning_rate,
-            "per_device_batch_size": self.per_device_batch_size,
-            "num_epochs": self.num_epochs,
-            "max_steps": self.max_steps,
-            "warmup_steps": self.warmup_steps,
-            "weight_decay": self.weight_decay,
-            "gradient_accumulation_steps": self.gradient_accumulation_steps,
-            "max_seq_length": self.max_seq_length,
-            "seed": self.seed,
-            "use_fp8": self.use_fp8,
-            "precision": self.mixed_precision,
+            "model": {
+                "name": self.model_name,
+                "max_position_embeddings": self.max_position_embeddings,
+                "vocab_size": self.vocab_size,
+                "hidden_size": self.hidden_size,
+                "num_hidden_layers": self.num_hidden_layers,
+                "num_attention_heads": self.num_attention_heads,
+                "n_inner": self.n_inner,
+                "layer_norm_epsilon": self.layer_norm_epsilon,
+                "resid_pdrop": self.resid_pdrop,
+                "embd_pdrop": self.embd_pdrop,
+                "attn_pdrop": self.attn_pdrop,
+                "last_linear_fp8": self.last_linear_fp8,
+            },
+            "training": {
+                "learning_rate": self.learning_rate,
+                "per_device_batch_size": self.per_device_batch_size,
+                "num_epochs": self.num_epochs,
+                "max_steps": self.max_steps,
+                "warmup_steps": self.warmup_steps,
+                "weight_decay": self.weight_decay,
+                "gradient_accumulation_steps": self.gradient_accumulation_steps,
+                "max_seq_length": self.max_seq_length,
+                "seed": self.seed,
+                "val_split": self.val_split,
+            },
+            "optimization": {
+                "use_fp8": self.use_fp8,
+                "precision": self.mixed_precision,
+                "load_pretrained_weights": self.load_pretrained_weights,
+            },
             "output_dir": self.output_dir,
         }
 
@@ -202,11 +259,14 @@ class GPT2FP8Trainer:
             logger.info("Setting up FP8 training with Transformer Engine...")
             kwargs_handlers.append(
                 TERecipeKwargs(
-                    fp8_format=te.recipe.Format.HYBRID,
+                    fp8_format=Format.HYBRID,
                     amax_compute_algo="max",
                     amax_history_len=16,
                     margin=0,
                 )
+            )
+            self.fp8_recipe = DelayedScaling(
+                fp8_format=Format.HYBRID, amax_history_len=16, amax_compute_algo="max"
             )
 
         if self.swanlab_log:
@@ -253,18 +313,60 @@ class GPT2FP8Trainer:
 
         model_id = model_mapping.get(self.model_name, self.model_name)
 
-        # Load tokenizer
-        self.tokenizer = AutoTokenizer.from_pretrained(model_id)
+        # Resolve overrides for model/tokenizer ids
+        if self.model_name_or_path:
+            model_id = self.model_name_or_path
+
+        tokenizer_id = self.tokenizer_name_or_path or model_id
+
+        # Load tokenizer (we still load tokenizer vocab even if not loading model weights)
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            tokenizer_id, revision=self.revision
+        )
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
-        # Load model
-        config = AutoConfig.from_pretrained(model_id)
-        # self.model = GPT2LMHeadModel.from_pretrained(model_id, config=config)
-        self.model = TEGPT2LMHeadModel(config)
+        # Build GPT2Config from trainer attributes
+        cfg = GPT2Config(
+            vocab_size=self.vocab_size,
+            n_positions=self.max_position_embeddings,
+            n_embd=self.hidden_size,
+            n_layer=self.num_hidden_layers,
+            n_head=self.num_attention_heads,
+            n_inner=self.n_inner,
+            activation_function=self.activation_function,
+            resid_pdrop=self.resid_pdrop,
+            embd_pdrop=self.embd_pdrop,
+            attn_pdrop=self.attn_pdrop,
+            layer_norm_epsilon=self.layer_norm_epsilon,
+            bos_token_id=self.tokenizer.bos_token_id,
+            eos_token_id=self.tokenizer.eos_token_id,
+        )
+
+        # Instantiate model: either load pretrained weights or initialize from config
+        if self.load_pretrained_weights:
+            try:
+                # prefer TE-backed from_pretrained if available
+                self.model = TEGPT2LMHeadModel.from_pretrained(
+                    model_id, config=cfg, last_linear_fp8=self.last_linear_fp8
+                )
+            except Exception:
+                logger.warning(
+                    "TE model from_pretrained failed; instantiating from config"
+                )
+                self.model = TEGPT2LMHeadModel(
+                    cfg,
+                    fp8_recipe=self.fp8_recipe,
+                    last_linear_fp8=self.last_linear_fp8,
+                )
+        else:
+            # Do not load pretrained weights — initialize model from config only
+            self.model = TEGPT2LMHeadModel(
+                cfg, fp8_recipe=self.fp8_recipe, last_linear_fp8=self.last_linear_fp8
+            )
 
         logger.info(
-            f"Model loaded successfully. Total parameters: {self.model.num_parameters():,}"
+            f"Model loaded successfully. Total parameters: {self.model.num_parameters()/1000**2:.2f}M"
         )
 
     def prepare_dataloaders(self):
@@ -385,7 +487,9 @@ class GPT2FP8Trainer:
             },
         ]
 
-        optimizer = AdamW(optimizer_grouped_parameters, lr=self.learning_rate)
+        optimizer = AdamW(
+            optimizer_grouped_parameters, lr=self.learning_rate, betas=self.betas
+        )
 
         # Calculate total steps
         if self.max_steps > 0:
@@ -414,9 +518,9 @@ class GPT2FP8Trainer:
         optimizer, lr_scheduler = self.setup_optimizer_and_scheduler(train_dataloader)
 
         # Prepare everything with accelerator
-        self.model, optimizer, train_dataloader, eval_dataloader, lr_scheduler = (
+        self.model, optimizer, train_dataloader, lr_scheduler = (
             self.accelerator.prepare(
-                self.model, optimizer, train_dataloader, eval_dataloader, lr_scheduler
+                self.model, optimizer, train_dataloader, lr_scheduler
             )
         )
 
